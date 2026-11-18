@@ -90,6 +90,9 @@
   right: 0;
   top: calc(100% + 6px);
 }
+.lb .rows:has(.pop) {
+  overflow: visible;
+}
 .lb .lb-head-actions {
   display: flex;
   gap: 8px;

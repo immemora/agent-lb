@@ -12,6 +12,7 @@ import type { AccountSummary } from "@/features/accounts/schemas";
 import { accountLabel, clock, compact, money, relative } from "../../format";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { PausePopover } from "../../kit/pause-popover";
+import { AccountQuotaIndicators } from "../../kit/account-quota-indicators";
 import { ProviderMark } from "../../kit/provider-mark";
 import { providerMark } from "../../kit/provider-mark-helpers";
 import {
@@ -316,6 +317,7 @@ export function AccountPage() {
             resetAt={account.rateLimitResetAt || account.resetAtPrimary}
             sub={account.status === "rate_limited" ? "· 5-hour window used up" : undefined}
           />
+          <AccountQuotaIndicators account={account} />
           {account.warmupUntil && new Date(account.warmupUntil).getTime() > Date.now() && (
             <span className="meta">
               Warming up until {new Date(account.warmupUntil).toLocaleString()}

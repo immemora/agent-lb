@@ -20,6 +20,7 @@ from app.core.providers.anthropic_compat import routes_openai_chat
 from app.core.utils.sse import inject_sse_keepalives
 from app.dependencies import ProxyContext, get_proxy_context
 from app.modules.api_keys.service_data import ApiKeyData
+from app.modules.proxy.affinity import build_downstream_turn_state_response_headers, ensure_http_downstream_turn_state
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
 from app.modules.proxy.constants import (
     CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS,
@@ -116,17 +117,36 @@ async def v1_chat_completions(
     )
     timer.mark("request_limits")
     responses_payload.stream = True
-    stream = context.service.stream_responses(
-        responses_payload,
-        request.headers,
-        codex_session_affinity=False,
-        propagate_http_errors=True,
-        openai_cache_affinity=True,
-        api_key=api_key,
-        api_key_reservation=reservation,
-        suppress_text_done_events=True,
-        retry_protocol_only_failures=True,
-    )
+    if get_settings().http_responses_session_bridge_enabled:
+        downstream_turn_state = ensure_http_downstream_turn_state(request.headers)
+        rate_limit_headers = {
+            **rate_limit_headers,
+            **build_downstream_turn_state_response_headers(downstream_turn_state),
+        }
+        stream = context.service.stream_http_responses(
+            responses_payload,
+            request.headers,
+            codex_session_affinity=False,
+            propagate_http_errors=True,
+            openai_cache_affinity=True,
+            api_key=api_key,
+            api_key_reservation=reservation,
+            suppress_text_done_events=True,
+            downstream_turn_state=downstream_turn_state,
+            retry_protocol_only_failures=True,
+        )
+    else:
+        stream = context.service.stream_responses(
+            responses_payload,
+            request.headers,
+            codex_session_affinity=False,
+            propagate_http_errors=True,
+            openai_cache_affinity=True,
+            api_key=api_key,
+            api_key_reservation=reservation,
+            suppress_text_done_events=True,
+            retry_protocol_only_failures=True,
+        )
     startup_probe_timeout = (
         CURSOR_CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS
         if cursor_compat_client

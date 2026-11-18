@@ -14,7 +14,7 @@ import {
   type Receipt,
 } from "../../api/receipts";
 import { usePools, useSeatActivity } from "../../api";
-import { FilterSelect, PageHead, Section, Toast } from "../../kit/primitives";
+import { FilterSelect, lbPortalContainer, PageHead, Section, Toast } from "../../kit/primitives";
 import { displayAccount, providerName } from "./usage-format";
 import { Breakdown, type Group } from "./usage-breakdown";
 import { SummaryStats, SeatActivityStats, SubscriptionQuota } from "./usage-stats";
@@ -243,7 +243,7 @@ export function UsagePage() {
             {params.get("model") || "All"}
             <ChevronDown size={13} />
           </DropdownMenu.Trigger>
-          <DropdownMenu.Portal>
+          <DropdownMenu.Portal container={lbPortalContainer()}>
             <DropdownMenu.Content className="lb-dropdown" sideOffset={5} align="end">
               <DropdownMenu.Item onSelect={() => update("model", "")}>All</DropdownMenu.Item>
               {modelGroups

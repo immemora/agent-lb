@@ -11,6 +11,7 @@ import { ProviderMark } from "../../kit/provider-mark";
 import { poolProvider, providerMark, vendorName } from "../../kit/provider-mark-helpers";
 import { AccountState, LimitMeter, Pace, PoolState, RowMenu } from "../../kit/primitives";
 import { PausePopover } from "../../kit/pause-popover";
+import { AccountQuotaIndicators } from "../../kit/account-quota-indicators";
 import type { z } from "zod";
 
 type Account = z.infer<typeof AccountSummarySchema>;
@@ -307,6 +308,7 @@ export function ProxyAccountRow({
         <>
           <span className={hideEmails ? "privacy-blur" : undefined}>{a.email}</span>
           <span className="mono id"> · {a.accountId.slice(0, 6)}</span>
+          <AccountQuotaIndicators account={a} />
         </>
       }
       state={

@@ -314,7 +314,7 @@ export function FilterSelect({
         {options.find((o) => o.value === value)?.label || value}
         <ChevronDown size={13} />
       </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
+      <DropdownMenu.Portal container={lbPortalContainer()}>
         <DropdownMenu.Content className="lb-dropdown" sideOffset={5} align="end">
           {options.map((o) => (
             <DropdownMenu.Item key={o.value} onSelect={() => onChange(o.value)}>
@@ -364,6 +364,9 @@ export function SearchField({
     </label>
   );
 }
+export function lbPortalContainer(): HTMLElement | undefined {
+  return document.querySelector<HTMLElement>(".lb") ?? undefined;
+}
 export function RowMenu({
   label,
   items,
@@ -380,7 +383,7 @@ export function RowMenu({
       >
         <MoreHorizontal size={16} />
       </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
+      <DropdownMenu.Portal container={lbPortalContainer()}>
         <DropdownMenu.Content
           className="lb-dropdown"
           sideOffset={5}
