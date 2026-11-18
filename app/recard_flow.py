@@ -21,9 +21,10 @@ from app.core.link_spend import (
     request_approval,
     request_state,
 )
+from app.core.profile_lock import profile_held
 from app.core.recards import load_recards, save_recard
-from app.core.subscriptions import Subscription, load_subscriptions, save_subscriptions
-from app.recard_notice import ASKER, CHAT, approval_ask, ask_for_approval, card_on, chat_line, tell_factory
+from app.core.subscriptions import LedgerUnavailable, Subscription, load_subscriptions, save_subscriptions
+from app.recard_notice import ASKER, CHAT, FLOOR, approval_ask, ask_for_approval, card_on, chat_line, tell_factory
 from app.recard_signin import signed_in_ahead
 from app.recard_watch import held, spawn
 from app.recard_window import open_billing_window
@@ -33,6 +34,7 @@ CLOSED = ("denied", "expired", "canceled", "declined")
 POLL_S = 4
 WATCH_S = 36 * 3600
 CARD_TRIES = 3
+LEAD_DAYS = int(os.getenv("AGENT_LB_RECARD_LEAD_DAYS", "3"))
 
 
 class RecardError(Exception):
@@ -84,7 +86,7 @@ def _dry_start(email: str, subscription: Subscription, total: float) -> dict:
         "ownerAsk": {
             "from": ASKER,
             "command": rails_ask.rails_command(ASKER, "ask"),
-            "arguments": {"to": "owner", "question": question, "options": options},
+            "arguments": rails_ask.owner_arguments(question, options, FLOOR),
             **rails_ask.reachable(ASKER),
         },
         "chatLine": {"to": CHAT, "mode": "queue", "text": chat_line(email, subscription.plan, total, url, signed)},
@@ -92,6 +94,13 @@ def _dry_start(email: str, subscription: Subscription, total: float) -> dict:
 
 
 def start(email: str, amount: float | None = None, *, dry_run: bool = False) -> dict:
+    with profile_held(email) as free:
+        if not free:
+            raise RecardError("the browser profile is busy with a reauth run; the next tick retries")
+        return _start(email, amount, dry_run=dry_run)
+
+
+def _start(email: str, amount: float | None, *, dry_run: bool) -> dict:
     subscription = _subscription(email)
     total = amount if amount is not None else subscription.amount_usd
     if not total:
@@ -152,26 +161,30 @@ def finish(email: str, *, save: bool = True) -> dict:
         if state["status"] != "approved":
             return save_recard(email, status=state["status"])
         save_recard(email, status="approved", approvedSeenAt=row.get("approvedSeenAt") or _now())
-        port = _signed_in_port(email)
-        with tempfile.TemporaryDirectory(prefix="agent-lb-recard-") as directory:
-            os.chmod(directory, 0o700)
-            card = load_card(row["requestId"], Path(directory))
-            last4 = put_card(port, email, card, save=save)
-            valid_until = str(card.get("valid_until") or "") or None
-            del card
+        with profile_held(email) as profile_free:
+            if not profile_free:
+                return row
+            port = _signed_in_port(email)
+            with tempfile.TemporaryDirectory(prefix="agent-lb-recard-") as directory:
+                os.chmod(directory, 0o700)
+                card = load_card(row["requestId"], Path(directory))
+                last4 = put_card(port, email, card, save=save)
+                valid_until = str(card.get("valid_until") or "") or None
+                del card
         if not save:
             return save_recard(email, detail="card form filled, not saved")
-        subscriptions = load_subscriptions()
-        subscription = subscriptions[email]
-        note = f"Recarded {date.today().isoformat()} with Link card ending {last4} for the {subscription.renews_on} renewal"
+        row = save_recard(email, status="done", last4=last4, validUntil=valid_until, detail=None, cardOnAt=_now())
+        renews_on = row.get("renewsOn")
+        note = f"Recarded {date.today().isoformat()} with Link card ending {last4} for the {renews_on} renewal"
         if valid_until:
             note += f"; card valid until {valid_until}"
-        subscriptions[email] = replace(subscription, note=note)
-        save_subscriptions(subscriptions)
-        row = save_recard(email, status="done", last4=last4, validUntil=valid_until, detail=None, cardOnAt=_now())
-        card_on(
-            email, f"{email}: Link card ending {last4} is on claude.ai for the {subscription.renews_on} renewal", row
-        )
+        try:
+            subscriptions = load_subscriptions()
+            subscriptions[email] = replace(subscriptions[email], note=note)
+            save_subscriptions(subscriptions)
+        except (LedgerUnavailable, KeyError) as exc:
+            row = save_recard(email, detail=f"card on; ledger note not written: {exc}")
+        card_on(email, f"{email}: Link card ending {last4} is on claude.ai for the {renews_on} renewal", row)
         return row
 
 
@@ -216,7 +229,7 @@ def watch(email: str) -> None:
                     open_billing_window(email)
                     tell_factory(f"{email}: Link approved; waiting for claude.ai sign-in in the billing window ({exc})")
                 time.sleep(POLL_S)
-            except (BillingError, LinkError, CdpError) as exc:
+            except (BillingError, LinkError, CdpError, LedgerUnavailable) as exc:
                 failures["card"] = failures.get("card", 0) + 1
                 save_recard(email, detail=str(exc))
                 if failures["card"] >= CARD_TRIES:
@@ -243,7 +256,7 @@ def _check_ahead(email: str, today: date, dry_run: bool) -> None:
     save_recard(email, signinCheckedOn=today.isoformat(), signinAhead=result)
     if not result.get("signedIn"):
         tell_factory(
-            f"{email}: its plan renews tomorrow and the Studio profile is not signed in to claude.ai "
+            f"{email}: its recard starts tomorrow and the Studio profile is not signed in to claude.ai "
             f"({result.get('how')}: {result.get('detail') or 'no session'}); no ask to Alex ahead of time",
             mode="note",
         )
@@ -257,7 +270,7 @@ def tick(dry_run: bool) -> None:
             continue
         row = recards.get(email, {})
         days = (date.fromisoformat(subscription.renews_on) - today).days
-        if days == 1:
+        if days == LEAD_DAYS + 1:
             _check_ahead(email, today, dry_run)
             continue
         same_cycle = row.get("renewsOn") == subscription.renews_on
@@ -269,7 +282,7 @@ def tick(dry_run: bool) -> None:
             continue
         if same_cycle and row.get("status") in CLOSED:
             continue
-        action = "watch" if same_cycle and row.get("status") in OPEN else "start" if -7 <= days <= 0 else None
+        action = "watch" if same_cycle and row.get("status") in OPEN else "start" if -7 <= days <= LEAD_DAYS else None
         if action is None:
             continue
         if dry_run:
@@ -282,7 +295,7 @@ def tick(dry_run: bool) -> None:
                 spawn(email)
             else:
                 finish(email)
-        except (RecardError, LinkError, BillingError, CdpError) as exc:
+        except (RecardError, LinkError, BillingError, CdpError, LedgerUnavailable) as exc:
             detail = str(exc)
             if load_recards().get(email, {}).get("detail") != detail:
                 has_request = load_recards().get(email, {}).get("renewsOn") == subscription.renews_on

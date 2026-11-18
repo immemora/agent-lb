@@ -9,6 +9,7 @@ from pathlib import Path
 
 CHROME_ROOT = Path.home() / "Library/Application Support/agent-lb-chrome"
 CDP_PORT_BASE = 9333
+LOGINS = ("google", "email")
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,9 @@ class BrowserProfile:
     dir: str
     providers: tuple[str, ...]
     cdp_port: int
+    color: str | None = None
+    label: str | None = None
+    login: str | None = None
 
 
 def registry_path() -> Path:
@@ -43,10 +47,15 @@ def load_profiles() -> dict[str, BrowserProfile]:
                 or type(port) is not int
                 or not CDP_PORT_BASE <= port <= 65535
                 or port in ports
+                or not isinstance(row.get("color", ""), str)
+                or not isinstance(row.get("label", ""), str)
+                or row.get("login", "google") not in LOGINS
             ):
                 return {}
             ports.add(port)
-            profiles[email] = BrowserProfile(email, row["dir"], tuple(row["providers"]), port)
+            profiles[email] = BrowserProfile(
+                email, row["dir"], tuple(row["providers"]), port, row.get("color"), row.get("label"), row.get("login")
+            )
         return profiles
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError):
         return {}
@@ -58,7 +67,14 @@ def save_profiles(profiles: dict[str, BrowserProfile]) -> None:
     data = {
         "version": 1,
         "profiles": {
-            email: {"dir": profile.dir, "providers": profile.providers, "cdpPort": profile.cdp_port}
+            email: {
+                "dir": profile.dir,
+                "providers": profile.providers,
+                "cdpPort": profile.cdp_port,
+                **({"color": profile.color} if profile.color else {}),
+                **({"label": profile.label} if profile.label else {}),
+                **({"login": profile.login} if profile.login else {}),
+            }
             for email, profile in profiles.items()
         },
     }
@@ -74,9 +90,21 @@ def save_profiles(profiles: dict[str, BrowserProfile]) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def add_profile(email: str, *, dir: str | None, providers: Sequence[str]) -> BrowserProfile:
+def add_profile(
+    email: str,
+    *,
+    dir: str | None,
+    providers: Sequence[str],
+    label: str | None = None,
+    color: str | None = None,
+    login: str | None = None,
+) -> BrowserProfile:
     email = email.strip().lower()
-    if not email or any(provider not in {"anthropic", "openai"} for provider in providers):
+    if (
+        not email
+        or any(provider not in {"anthropic", "openai"} for provider in providers)
+        or login not in (None, *LOGINS)
+    ):
         raise ValueError("email and supported providers are required")
     profiles = load_profiles()
     previous = profiles.get(email)
@@ -90,7 +118,10 @@ def add_profile(email: str, *, dir: str | None, providers: Sequence[str]) -> Bro
     if not directory or (not Path(directory).is_absolute() and ".." in Path(directory).parts):
         raise ValueError("profile dir must be absolute or relative within the Chrome root")
     merged = tuple(dict.fromkeys((previous.providers if previous else ()) + tuple(providers)))
-    profile = BrowserProfile(email, directory, merged, port)
+    color = color or (previous.color if previous else None)
+    label = label or (previous.label if previous else None) or email
+    login = login or (previous.login if previous else None)
+    profile = BrowserProfile(email, directory, merged, port, color, label, login)
     profiles[email] = profile
     save_profiles(profiles)
     return profile

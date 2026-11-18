@@ -6,19 +6,26 @@ import os
 import subprocess
 import sys
 import time
-from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlencode, urlsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.parse import quote, urlencode
 
 from app.core.browser_profiles import BrowserProfile, add_profile, load_profiles, profile_for, user_data_dir
-from app.status_cli import DEFAULT_BASE_URL, StatusObservationError, _NoRedirect, _validated_base_url
+from app.core.cdp_page import close_browser
+from app.core.profile_lock import profile_held
+from app.core.profile_theme import apply_theme, display_name, pick_color, theme_color
+from app.lb_service import (
+    ServiceError,
+    ServiceUnavailable,
+    account_for,
+    cdp_ready,
+    close_stale_callbacks,
+    request,
+    retrying,
+    send_callback,
+)
+from app.status_cli import DEFAULT_BASE_URL, StatusObservationError, _validated_base_url
 
 PROVIDERS = ("anthropic", "openai")
-
-
-class ProfilesError(Exception):
-    pass
+SKIPPED_PROVIDERS = ("openai",)
 
 
 def add_parser(subparsers) -> None:
@@ -30,6 +37,8 @@ def add_parser(subparsers) -> None:
     adding.add_argument("email")
     adding.add_argument("--dir")
     adding.add_argument("--provider", choices=PROVIDERS, nargs="+", action="extend", default=[])
+    adding.add_argument("--label")
+    adding.add_argument("--login", choices=("google", "email"), help="How the account signs in to claude.ai.")
     opening = commands.add_parser("open")
     opening.add_argument("email")
     reauth = subparsers.add_parser("reauth", help="Reauthenticate in an account's Chrome profile.")
@@ -42,6 +51,7 @@ def add_parser(subparsers) -> None:
     reauth.add_argument("--warmup-hours", type=float)
     reauth.add_argument("--warmup-capacity-percent", type=float, default=15.0)
     reauth.add_argument("--warmup-max-concurrent", type=int, default=2)
+    reauth.add_argument("--auto", action="store_true", help="Reuse the profile's session; never type or page.")
 
 
 def chrome_argv(profile: BrowserProfile, url: str) -> list[str]:
@@ -80,6 +90,7 @@ def run_profiles(args) -> None:
                     "dir": profile.dir,
                     "providers": profile.providers,
                     "cdpPort": profile.cdp_port,
+                    "login": profile.login,
                     "exists": user_data_dir(profile).is_dir(),
                 }
                 for profile in load_profiles().values()
@@ -92,10 +103,7 @@ def run_profiles(args) -> None:
                         f"{row['email']}\t{row['dir']}\t{','.join(row['providers'])}\t{row['cdpPort']}\t{row['exists']}"
                     )
         elif args.profiles_command == "add":
-            profile = add_profile(args.email, dir=args.dir, providers=args.provider)
-            if not user_data_dir(profile).is_dir():
-                print(f"warning: profile directory does not exist: {user_data_dir(profile)}", file=sys.stderr)
-            print(f"registered {profile.email} (profile {profile.dir}, CDP {profile.cdp_port})")
+            _add(args)
         else:
             launch_profile(_profile(args.email), "about:blank")
     except (OSError, ValueError) as exc:
@@ -103,101 +111,65 @@ def run_profiles(args) -> None:
         raise SystemExit(1) from None
 
 
-def _request(base: str, path: str, *, body: dict | None = None, method: str | None = None, cdp: bool = False) -> Any:
-    headers = {"Accept": "application/json"}
-    if not cdp and (cookie := os.getenv("AGENT_LB_STATUS_COOKIE")):
-        headers["Cookie"] = cookie
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    request = Request(
-        base + path,
-        data=json.dumps(body).encode() if body is not None else None,
-        headers=headers,
-        method=method or ("POST" if body is not None else "GET"),
-    )
-    try:
-        with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=2 if cdp else 10) as response:
-            return json.load(response)
-    except HTTPError as exc:
-        if exc.code == 409 and not cdp:
-            try:
-                error = json.load(exc).get("error", {})
-                if error.get("code") == "oauth_owner_required":
-                    raise ProfilesError(error.get("message", "OAuth must run on the owner instance")) from None
-            except (ValueError, AttributeError):
-                pass
-        raise ProfilesError(f"service returned HTTP {exc.code}") from None
-    except (URLError, OSError, ValueError):
-        raise ProfilesError("service unavailable or returned invalid JSON") from None
+def _add(args) -> None:
+    email = args.email.strip().lower()
+    others = [profile for key, profile in load_profiles().items() if key != email]
+    previous = profile_for(email)
+    current = (previous.color if previous else None) or (theme_color(user_data_dir(previous)) if previous else None)
+    used = [profile.color or theme_color(user_data_dir(profile)) for profile in others]
+    color = pick_color(current, used)
+    profile = add_profile(email, dir=args.dir, providers=args.provider, label=args.label, color=color, login=args.login)
+    name = display_name(color, profile.label or profile.email, profile.providers)
+    data = user_data_dir(profile)
+    if cdp_ready(f"http://127.0.0.1:{profile.cdp_port}"):
+        print(f"warning: {profile.email} Chrome is running; close it and rerun to apply {name!r}", file=sys.stderr)
+    else:
+        apply_theme(data, color, name)
+    print(f"registered {profile.email} as {name!r} (profile {profile.dir}, CDP {profile.cdp_port})")
 
 
-def _cdp_ready(base: str) -> bool:
-    try:
-        return isinstance(_request(base, "/json/version", cdp=True), dict)
-    except ProfilesError:
-        return False
-
-
-def _open_browser(profile: BrowserProfile, url: str, cdp: str) -> bool:
-    if _cdp_ready(cdp):
-        _request(cdp, "/json/new?" + quote(url, safe=""), method="PUT", cdp=True)
-        return True
+def _open_browser(profile: BrowserProfile, url: str, cdp: str) -> tuple[bool, bool]:
+    if cdp_ready(cdp):
+        request(cdp, "/json/new?" + quote(url, safe=""), method="PUT", cdp=True)
+        return True, False
     launch_profile(profile, url)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if _cdp_ready(cdp):
-            return True
+        if cdp_ready(cdp):
+            return True, True
         time.sleep(0.25)
     print(f"close the {profile.email} Chrome window and rerun", file=sys.stderr)
-    return False
-
-
-def _account(base: str, email: str, provider: str | None = None) -> dict | None:
-    response = _request(base, "/api/accounts")
-    if not isinstance(response, dict) or not isinstance(response.get("accounts"), list):
-        raise ProfilesError("service returned a malformed accounts response")
-    return next(
-        (
-            row
-            for row in response["accounts"]
-            if row.get("email", "").lower() == email and (provider is None or row.get("provider") == provider)
-        ),
-        None,
-    )
+    return False, True
 
 
 def _wait(args, profile: BrowserProfile, provider: str, base: str, flow: dict, cdp: str, debug: bool) -> None:
     started = time.monotonic()
-    sent = False
+    handled: set[str] = set()
     prompted = False
+    down = False
     while time.monotonic() - started < args.timeout:
-        if debug and provider == "anthropic" and not sent and flow.get("callbackUrl"):
-            try:
-                pages = _request(cdp, "/json/list", cdp=True)
-            except ProfilesError:
-                pages = []
-            for page in pages:
-                url = page.get("url", "")
-                if (
-                    page.get("type") == "page"
-                    and url.startswith(flow["callbackUrl"])
-                    and parse_qs(urlsplit(url).query).get("code")
-                ):
-                    sent = True
-                    _request(base, "/api/oauth/manual-callback", body={"flowId": flow["flowId"], "callbackUrl": url})
-                    break
-        status = _request(base, "/api/oauth/status?" + urlencode({"flowId": flow["flowId"]}))
-        if status.get("status") == "success":
-            account = _account(base, profile.email, provider)
-            if account is None:
-                raise ProfilesError(f"signed-in account did not match {profile.email}")
-            result = {"email": profile.email, "status": account.get("status")}
-            print(json.dumps(result) if args.json else f"{profile.email}: {result['status']}")
-            if result["status"] != "active":
-                raise SystemExit(1)
-            return
-        if status.get("status") == "error":
-            raise ProfilesError(status.get("errorMessage") or "OAuth failed")
+        try:
+            if debug and provider == "anthropic" and flow.get("callbackUrl"):
+                send_callback(base, flow, cdp, handled)
+            status = request(base, "/api/oauth/status?" + urlencode({"flowId": flow["flowId"]}))
+            if status.get("status") == "success":
+                account = retrying(lambda: account_for(base, profile.email, provider), "account lookup")
+                if account is None:
+                    raise ServiceError(f"signed-in account did not match {profile.email}")
+                result = {"email": profile.email, "status": account.get("status")}
+                print(json.dumps(result) if args.json else f"{profile.email}: {result['status']}")
+                if result["status"] != "active":
+                    raise SystemExit(1)
+                return
+            if status.get("status") == "error":
+                raise ServiceError(status.get("errorMessage") or "OAuth failed")
+            if down:
+                print("agent-lb reachable again", file=sys.stderr)
+                down = False
+        except ServiceUnavailable as exc:
+            if not down:
+                print(f"agent-lb unreachable ({exc}); retrying until the timeout", file=sys.stderr)
+                down = True
         if not prompted and time.monotonic() - started >= 15:
             print(f"sign-in needed in the {profile.email} window; waiting up to {args.timeout:g}s", file=sys.stderr)
             prompted = True
@@ -211,17 +183,36 @@ def run_reauth(args) -> None:
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         print("--timeout must be finite and greater than zero", file=sys.stderr)
         raise SystemExit(2)
+    with profile_held(profile.email) as free:
+        if not free:
+            print(
+                f"another reauth, recard or auto run is using the {profile.email} profile; rerun shortly",
+                file=sys.stderr,
+            )
+            raise SystemExit(4)
+        _reauth(args, profile)
+
+
+def _reauth(args, profile: BrowserProfile) -> None:
     try:
         provider = args.provider or (profile.providers[0] if len(profile.providers) == 1 else None)
         base = ""
         if not args.dry_run:
             base = _validated_base_url(args.base_url or os.getenv("AGENT_LB_BASE_URL", DEFAULT_BASE_URL))
             if provider is None:
-                account = _account(base, profile.email)
+                account = retrying(lambda: account_for(base, profile.email), "account lookup")
                 provider = account.get("provider") if account else None
+        if provider in SKIPPED_PROVIDERS:
+            result = {"email": profile.email, "status": "skipped", "reason": f"{provider} accounts are not reauthed"}
+            print(json.dumps(result) if args.json else f"{profile.email}: skipped ({result['reason']})")
+            return
         if provider not in PROVIDERS:
-            raise ProfilesError("choose --provider anthropic or openai; dry-run cannot query account providers")
+            raise ServiceError("choose --provider anthropic or openai; dry-run cannot query account providers")
         body = {"provider": provider, "forceMethod": "browser"}
+        if not args.dry_run:
+            account = retrying(lambda: account_for(base, profile.email, provider), "account lookup")
+            if account and account.get("accountId"):
+                body["expectedAccountId"] = account["accountId"]
         if args.warmup_hours is not None:
             body.update(
                 {
@@ -242,13 +233,17 @@ def run_reauth(args) -> None:
                 )
             )
             return
-        flow = _request(base, "/api/oauth/start", body=body)
+        flow = retrying(lambda: request(base, "/api/oauth/start", body=body), "oauth start")
         if not isinstance(flow, dict) or not flow.get("flowId") or not flow.get("authorizationUrl"):
-            raise ProfilesError("service returned an incomplete browser OAuth flow")
+            raise ServiceError("service returned an incomplete browser OAuth flow")
         cdp = f"http://127.0.0.1:{profile.cdp_port}"
-        debug = _open_browser(profile, flow["authorizationUrl"], cdp)
+        if flow.get("callbackUrl"):
+            close_stale_callbacks(cdp, flow["callbackUrl"])
+        debug, launched = _open_browser(profile, flow["authorizationUrl"], cdp)
         _wait(args, profile, provider, base, flow, cdp, debug)
-    except (ProfilesError, StatusObservationError) as exc:
+        if launched:
+            close_browser(profile.cdp_port)
+    except (ServiceError, StatusObservationError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from None
     except (OSError, ValueError, TypeError, AttributeError, KeyError):

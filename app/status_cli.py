@@ -13,6 +13,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from app.lb_caller_key import caller_key_headers
+
 from app.status_projection import _model_observation, _optional_text, _project_account, _provider_summaries, _text
 
 SCHEMA_VERSION = 1
@@ -180,13 +182,13 @@ def _validated_base_url(value: str) -> str:
 
 
 def get_status_json(url: str, timeout: float) -> Any:
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", **caller_key_headers("agent-lb-key-status-cli")}
 
     if cookie := os.getenv("AGENT_LB_STATUS_COOKIE"):
         headers["Cookie"] = cookie
     request = Request(url, headers=headers, method="GET")
     try:
-        opener = build_opener(ProxyHandler({}), _NoRedirect())
+        opener = build_opener(ProxyHandler({}), NoRedirect())
         with opener.open(request, timeout=timeout) as response:  # noqa: S310 -- URL is explicit local/operator input.
             if response.status < 200 or response.status >= 300:
                 raise StatusObservationError(f"service returned HTTP {response.status}")
@@ -200,7 +202,7 @@ def get_status_json(url: str, timeout: float) -> Any:
         raise StatusObservationError("service is unavailable or did not respond") from exc
 
 
-class _NoRedirect(HTTPRedirectHandler):
+class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *_args: Any, **_kwargs: Any) -> Request | None:
         return None
 
