@@ -37,6 +37,12 @@ services:
     environment:
       TS_STATE_DIR: /var/lib/tailscale
       TS_USERSPACE: "false"
+      # Tunnel MTU 1200 (default 1280). Some client uplinks carry only 1280-byte
+      # packets (e.g. WSL eth0 behind a VPN); WireGuard adds ~60-80 bytes, so on
+      # a direct UDP path full-size tunnel packets were silently dropped and any
+      # request body over ~1 KB hung. 1200 makes TCP negotiate MSS 1160, which
+      # fits a 1280 underlay over IPv4 and IPv6, for every client.
+      TS_DEBUG_MTU: "1200"
     volumes:
       - ./status/tailscale:/var/lib/tailscale
     devices:
