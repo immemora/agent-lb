@@ -1,0 +1,4 @@
+# Runtime state and secrets: never committed.
+/status/
+/.env
+/.env.*

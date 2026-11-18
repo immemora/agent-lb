@@ -1,0 +1,163 @@
+# codex-gateway deployment of vanilla agent-lb, migrated from codex-lb-hardened.
+# Run from this directory:  docker compose build && docker compose up -d
+# One-time prerequisite: ./init-env.sh  (creates .env and .env.tailscale).
+#
+# Network layout:
+# - tailscale, postgres, seed, token-vault, retention and prepare(none) sit on
+#   the default compose bridge network; postgres is reachable only there.
+# - server (2455, 1455) and proxy (80) share the tailscale network namespace,
+#   so they are reachable on the tailnet as tailscale-codex-lb.
+
+name: codex-gateway
+
+x-agent-lb-env: &agent-lb-env
+  AGENT_LB_DATABASE_URL: postgresql+asyncpg://agent_lb:${POSTGRES_PASSWORD:?run ./init-env.sh first}@postgres:5432/agent_lb
+  AGENT_LB_DATA_DIR: /var/lib/agent-lb
+  AGENT_LB_ENCRYPTION_KEY_FILE: /var/lib/agent-lb/encryption.key
+
+services:
+  prepare:
+    image: agent-lb:local
+    pull_policy: never
+    user: "0:0"
+    network_mode: none
+    entrypoint: ["sh", "/tools/prepare.sh"]
+    volumes:
+      - ../../codex-lb-hardened/status/tailscale:/source-tailscale:ro
+      - ./status:/status
+      - ../../.token-vault:/vault
+      - ./tools:/tools:ro
+    restart: "no"
+
+  tailscale:
+    image: tailscale/tailscale:v1.98.4
+    hostname: tailscale-codex-lb
+    env_file:
+      - .env.tailscale
+    environment:
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+    volumes:
+      - ./status/tailscale:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - net_admin
+      - net_raw
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18.7-alpine
+    environment:
+      POSTGRES_USER: agent_lb
+      POSTGRES_DB: agent_lb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run ./init-env.sh first}
+    volumes:
+      - ./status/postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_lb -d agent_lb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      prepare:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  seed:
+    image: agent-lb:local
+    pull_policy: never
+    entrypoint: ["python", "/tools/seed.py"]
+    environment:
+      <<: *agent-lb-env
+      TOKEN_VAULT_DIR: /vault
+      SEED_SOURCE_DIR: /source
+    volumes:
+      - ../../codex-lb-hardened/status/codex-lb:/source:ro
+      - ../../.token-vault:/vault:ro
+      - ./status/agent-lb:/var/lib/agent-lb
+      - ./tools:/tools:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  server:
+    image: agent-lb:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    network_mode: service:tailscale
+    environment:
+      <<: *agent-lb-env
+      # nginx on :80 (loopback) forwards the real tailnet client address.
+      AGENT_LB_FIREWALL_TRUST_PROXY_HEADERS: "true"
+      AGENT_LB_FIREWALL_TRUSTED_PROXY_CIDRS: 127.0.0.1/32,::1/128
+    volumes:
+      - ./status/agent-lb:/var/lib/agent-lb
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:2455/health/ready', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    depends_on:
+      tailscale:
+        condition: service_started
+        restart: true
+      postgres:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  proxy:
+    image: nginx:1.30.6-alpine
+    network_mode: service:tailscale
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      tailscale:
+        condition: service_started
+        restart: true
+      server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  token-vault:
+    image: agent-lb:local
+    pull_policy: never
+    init: true
+    entrypoint: ["python", "/tools/vault.py", "watch-postgres"]
+    environment:
+      <<: *agent-lb-env
+      TOKEN_VAULT_DIR: /vault
+    volumes:
+      - ../../.token-vault:/vault
+      - ./status/agent-lb:/var/lib/agent-lb:ro
+      - ./tools:/tools:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  retention:
+    image: agent-lb:local
+    pull_policy: never
+    init: true
+    entrypoint: ["sh", "/tools/retention.sh"]
+    environment:
+      <<: *agent-lb-env
+    volumes:
+      - ./status/retention-archive:/archive
+      - ./approvals:/approval:ro
+      - ./tools:/tools:ro
+    depends_on:
+      server:
+        condition: service_healthy
+    restart: unless-stopped
