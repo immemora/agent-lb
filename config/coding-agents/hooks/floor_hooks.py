@@ -17,13 +17,13 @@ FLOOR_HOOKS = {
     "dangerous-command-guard.sh": "destructive data: dangerous shell commands blocked",
     "host-credential-guard.py": "secrets: host credential files never read",
     "gh-write-guard.py": "git: no gh writes",
-    "kill-scope-guard.py": "destructive: protected processes",
     "user-manager-guard.py": "destructive: protected processes",
     "desktop-guard": "real people, his accounts and spend: agents stay off his desktop, where those happen",
     "wide-scan-guard.sh": "secrets: no recursive reads that print secrets",
     "hooks-off-guard.py": "every floor: no setting that switches Claude Code hooks off",
     "outbound-send-guard.py": "real people: no direct Messages, Mail, SMS or mail-API send without a Rails hold receipt for that exact text",
     "claim-code-redact.py": "secrets: Rails one-use claim codes (rac_) never show in tool output",
+    "claim_codes.py": "secrets: the claim code pattern and mask shared by claim-code-redact and the floor runner",
 }
 NON_FLOOR_GUARDS = {
     "t3-live-restart-guard.py": "house rule: live T3 restarts use the nightly installer",
@@ -36,6 +36,7 @@ NON_FLOOR_GUARDS = {
     "wrangler-d1-guard.py": "house rule: ad-hoc SQL on the live rails-one D1 goes through rails-one-sql, not raw wrangler d1 execute --remote",
     "t3-db-guard.py": "house rule: no direct reads of a live T3 state database (statev2.sqlite); use the t3 CLI or T3 MCP",
     "clerk-secret-guard.py": "house rule: product agent homes never read the prod Clerk secret, agent-secret's custody store or the test token script",
+    "bridge-restart-guard.py": "house rule: rails-chat-bridge restarts go through the host updater or a Factory drained roll, never by hand",
     "personal-token-guard.py": "house rule: no agent session names or reads Alex's or Nate's personal Vercel tokens without Alex's yes",
 }
 FLOOR_TEXT = "BLOCKED: Dangerous command"

@@ -21,6 +21,7 @@ from claude_config_hooks import claude_config_files  # type: ignore[missing-impo
 from client_bundle import install_client_bundle, stale_client_bundle  # type: ignore[missing-import]
 from codex_home import codex_changes  # type: ignore[missing-import]
 from codex_hook_trust import trust_floor_hooks  # type: ignore[missing-import]
+from codex_scrub_timer import ensure_scrub_timer  # type: ignore[missing-import]
 from dispatch_parity import run_parity  # type: ignore[missing-import]
 from floor_allowlist import non_floor_check, unwrap_floors  # type: ignore[missing-import]
 from floor_invariant import refuse_floor_changes  # type: ignore[missing-import]
@@ -28,6 +29,7 @@ from harness_mcp import ensure_harness_mcp  # type: ignore[missing-import]
 from hook_inventory import hook_path_problems, keep_floor_targets, validate_hook_changes  # type: ignore[missing-import]
 from policy_documents import install_adapter, install_codex_doc, read_text, render_codex_body, uninstall_adapter  # type: ignore[missing-import]  # fmt: skip
 from policy_files import autocompact_text, checkpoint_changes, write_atomic  # type: ignore[missing-import]
+from policy_foreign_targets import foreign_target  # type: ignore[missing-import]
 from policy_hook_groups import opaque_floor_commands  # type: ignore[missing-import]
 from policy_hook_handlers import apply_handlers, handler_folds_known, load_handlers  # type: ignore[missing-import]  # fmt: skip
 from policy_hook_install import dispatch_worth, managed_hooks, pin_inproc  # type: ignore[missing-import]
@@ -320,6 +322,7 @@ def main() -> int:
         print(hand_off(source, args.home, changes))
     if not args.uninstall:
         print("local MCP: " + json.dumps(ensure_harness_mcp(args.home, subprocess.run), sort_keys=True))
+    print("codex rollout scrub: " + ensure_scrub_timer(args.home, not args.uninstall))
     if not changes:
         for reason, path in preserved_agents:
             print(f"preserved {reason} {path}")
@@ -342,8 +345,9 @@ def main() -> int:
     first_files = {args.home / ".claude" / DISPATCH_SCRIPT, legacy_path} | ({rev_path} if rev_path else set())
     latest_files = {registry_path, backup_path}
 
+    foreign = foreign_target(args.home)
     for target in managed_hooks(args.home, source):
-        if target.is_file() and not os.access(target, os.X_OK):
+        if target.is_file() and not foreign(target) and not os.access(target, os.X_OK):
             os.chmod(target, target.stat().st_mode | 0o111)
 
     guard_files = set(managed_hooks(args.home, source)) - {args.home / ".claude" / DISPATCH_SCRIPT}

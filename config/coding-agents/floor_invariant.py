@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -77,9 +78,18 @@ def placed(entry: tuple[str, str, str]) -> tuple[str, str, str]:
 
 def overlaps(first: str, second: str) -> bool:
     names = [json.loads(matcher) for matcher in (first, second)]
-    if any(not isinstance(name, str) or name in ("", "*") or not NAME_LIST.fullmatch(name) for name in names):
+    if any(not isinstance(name, str) or name in ("", "*") for name in names):
         return True
-    return bool(set(names[0].split("|")) & set(names[1].split("|")))
+    tools = [name for name in names if NAME_LIST.fullmatch(name)]
+    patterns = [name for name in names if not NAME_LIST.fullmatch(name)]
+    if not patterns:
+        return bool(set(names[0].split("|")) & set(names[1].split("|")))
+    if not tools:
+        return True
+    try:
+        return any(re.search(patterns[0], tool) for tool in tools[0].split("|"))
+    except re.error:
+        return True
 
 
 def planned_text(path: Path, changes: dict[Path, str | None]) -> str | None:
@@ -157,6 +167,9 @@ def floor_problems(home: Path, changes: dict[Path, str | None]) -> list[str]:
             if held_by_root(json.loads(hook).get("command") or "", held):
                 continue
             if command in retired and not mentioned_floors(command):
+                continue
+            dropped = hashlib.sha256(command.encode()).hexdigest() in layout.DISPATCH_DROPPED
+            if dropped and not mentioned_floors(command):
                 continue
             problems.append(f"{path}: floor entry at {context} matcher {matcher} would change or go: {hook}")
         for context, matcher, hook in (Counter(after) - Counter(before)).elements():
